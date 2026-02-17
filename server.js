@@ -2,18 +2,40 @@ require('dotenv').config();
 const { exec } = require('child_process');
 const express = require('express');
 
-
 // importe o google:
 const { google } = require('googleapis');
 
-// ...
+// --- Google Drive Auth (Windows-friendly) ---
+// Preferência: arquivo JSON apontado por GOOGLE_APPLICATION_CREDENTIALS
+// Fallback: GOOGLE_SERVICE_ACCOUNT_JSON (se você quiser continuar usando)
+let driveAuth = null;
 
-// agora use JSON.parse na variável de ambiente:
-const driveAuth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
-  scopes: ['https://www.googleapis.com/auth/drive']
-});
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  driveAuth = new google.auth.GoogleAuth({
+    keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    scopes: ['https://www.googleapis.com/auth/drive'],
+  });
+} else if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+  // fallback robusto: aceita string com quebras "\n" etc.
+  let raw = String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON).trim();
 
+  // se vier entre aspas no .env, remove
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1);
+  }
+
+  // tenta normalizar \n (se veio como texto literal)
+  raw = raw.replace(/\\n/g, '\n');
+
+  driveAuth = new google.auth.GoogleAuth({
+    credentials: JSON.parse(raw),
+    scopes: ['https://www.googleapis.com/auth/drive'],
+  });
+} else {
+  console.warn(
+    '[GOOGLE] Nenhuma credencial configurada. Defina GOOGLE_APPLICATION_CREDENTIALS (recomendado) ou GOOGLE_SERVICE_ACCOUNT_JSON.'
+  );
+}
 
 // 2) Cliente da API Drive v3
 const drive = google.drive({ version: 'v3', auth: driveAuth });
@@ -25,29 +47,46 @@ const drive = google.drive({ version: 'v3', auth: driveAuth });
  * @param {string} mimeType  Tipo MIME (ex.: 'application/pdf')
  */
 async function overwriteDriveFile(fileId, buffer, mimeType) {
+  if (!driveAuth) {
+    throw new Error('Google Drive não configurado. Defina GOOGLE_APPLICATION_CREDENTIALS ou GOOGLE_SERVICE_ACCOUNT_JSON.');
+  }
   await drive.files.update({
     fileId,
-    media: { mimeType, body: buffer }
+    media: { mimeType, body: buffer },
   });
 }
 
-// Verifica se o ImageMagick está instalado
-exec('convert -version', (error, stdout, stderr) => {
-  if (error) {
-    console.error(`ImageMagick não está instalado ou não está no PATH: ${error.message}`);
-  } else {
-    console.log(`ImageMagick:\n${stdout}`);
-  }
-});
+const IM_CHECK = process.platform === 'win32' ? 'magick -version' : 'convert -version';
+const GS_CHECK = process.platform === 'win32' ? 'gswin64c -version' : 'gs -version';
 
-// Verifica se o Ghostscript está instalado
-exec('gs -version', (error, stdout, stderr) => {
-  if (error) {
-    console.error(`Ghostscript não está instalado ou não está no PATH: ${error.message}`);
-  } else {
-    console.log(`Ghostscript:\n${stdout}`);
+// Só tenta checar se o binário existir (evita poluir log)
+(async () => {
+  try {
+    const imBin = process.platform === 'win32' ? 'magick' : 'convert';
+    if (await hasBinary(imBin)) {
+      exec(IM_CHECK, (error, stdout) => {
+        if (error) console.error(`ImageMagick check falhou: ${error.message}`);
+        else console.log(`ImageMagick:\n${stdout}`);
+      });
+    } else {
+      console.warn('ImageMagick não encontrado no PATH (ok se não for usar).');
+    }
+
+    const gsBin = process.platform === 'win32' ? 'gswin64c' : 'gs';
+    if (await hasBinary(gsBin)) {
+      exec(GS_CHECK, (error, stdout) => {
+        if (error) console.error(`Ghostscript check falhou: ${error.message}`);
+        else console.log(`Ghostscript:\n${stdout}`);
+      });
+    } else {
+      console.warn('Ghostscript não encontrado no PATH (ok se não for usar).');
+    }
+  } catch (e) {
+    console.warn('Falha ao checar binários:', e.message);
   }
-});
+})();
+
+
 const app = express();
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
@@ -57,15 +96,14 @@ const cors = require('cors');
 const path = require('path');
 const multer = require('multer');
 const AdmZip = require('adm-zip');
-const pdfParse = require("pdf-parse");
-const fs = require("fs");
-const os = require("os");
+const pdfParse = require('pdf-parse');
+const fs = require('fs');
+const os = require('os');
 const util = require('util');
 const execP = util.promisify(exec);
 const { createWorker } = require('tesseract.js');
-const { PDFDocument, StandardFonts /*, rgb (se quiser usar cor) */ } = require('pdf-lib');
+const { PDFDocument, StandardFonts } = require('pdf-lib');
 const { exec: execShell } = require('child_process');
-
 
 // perto do topo você já tem: const express = require('express'); const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -107,19 +145,11 @@ function normalizeLangs(input) {
   return s.split('+').map(t => t.trim()).filter(Boolean).join('+');
 }
 
-function toLangArray(input) {
-  if (Array.isArray(input)) return input.filter(Boolean).map(String);
-  return String(input || 'eng').split('+').map(s => s.trim()).filter(Boolean);
-}
-
-
-
-
 async function getWorker(langs = 'por') {
   console.log(`[OCR] Criando worker Tesseract.js`);
-  
+
   const worker = await createWorker();
-  
+
   try {
     console.log('[OCR] Carregando idioma português...');
     await worker.loadLanguage('por');
@@ -133,24 +163,21 @@ async function getWorker(langs = 'por') {
       console.log('[OCR] Worker inicializado com inglês');
     } catch (fallbackError) {
       console.error('[OCR] Falha total na inicialização:', fallbackError.message);
-      try {
-        await worker.terminate();
-      } catch {}
+      try { await worker.terminate(); } catch {}
       throw new Error('Não foi possível inicializar o Tesseract.js');
     }
   }
 
   return worker;
 }
+
 /**
  * Torna um PDF pesquisável (OCR):
  * A) ocrmypdf (se instalado)
- * B) tesseract CLI + pdftoppm (se instalados)
- * C) tesseract.js (WASM) + pdftoppm (sempre disponível no Render Free)
+ * C) tesseract.js (WASM) + pdftoppm (robusto)
+ *
+ * (Removi o "Caminho B" porque no seu código ele estava quebrado)
  */
-
-
-
 async function makePdfSearchable(inBuffer, langs = 'por+eng') {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocr-'));
   const inPath = path.join(tmpDir, 'input.pdf');
@@ -168,37 +195,8 @@ async function makePdfSearchable(inBuffer, langs = 'por+eng') {
       return out;
     }
 
-    // --- Caminho B: Tesseract CLI + pdftoppm
-    const hasPdftoppm = await hasBinary('pdftoppm');
-    const hasTesseract = await hasBinary('tesseract');
-    if (hasPdftoppm && hasTesseract) {
-      console.log('[OCR] Usando tesseract CLI + pdftoppm');
-      const parsed = await pdfParse(inBuffer);
-      const numPages = parsed.numpages || 1;
-      console.log(`[OCR] Páginas: ${numPages}`);
-
-      const pagePdfBuffers = [];
-      for (let i = 1; i <= numPages; i++) {
-        const ppmPrefix = path.join(tmpDir, `page_${i}`);
-        await execP(`pdftoppm -tiff -f ${i} -l ${i} "${inPath}" "${ppmPrefix}"`);
-        const tiffPath = `${ppmPrefix}-1.tif`;
-        const pageOut = path.join(tmpDir, `ocr_page_${i}`);
-        await execP(`pdftoppm -png -r 300 -f ${i} -l ${i} "${inPath}" "${outPrefix}"`);
-        pagePdfBuffers.push(fs.readFileSync(`${pageOut}.pdf`));
-      }
-
-      const mergedB = await PDFDocument.create();
-      for (const buf of pagePdfBuffers) {
-        const part = await PDFDocument.load(buf, { ignoreEncryption: true });
-        const pages = await mergedB.copyPages(part, part.getPageIndices());
-        pages.forEach(p => mergedB.addPage(p));
-      }
-      const mergedBytes = await mergedB.save();
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-      return Buffer.from(mergedBytes);
-    }
-
     // --- Caminho C: Tesseract.js (WASM) + pdftoppm (robusto)
+    const hasPdftoppm = await hasBinary('pdftoppm');
     if (!hasPdftoppm) {
       throw new Error('Nenhuma rota de OCR disponível: falta pdftoppm.');
     }
@@ -303,9 +301,8 @@ async function optimizeJpegBuffer(inputBuffer, maxWidth = 1500, quality = 85) {
 
     // -resize Wx> só reduz (não amplia); mantém proporção
     const cmd =
-    `${IM_BIN} "${inPath}" -resize ${safeMax}x${safeMax}>` + // limita LADO MAIOR a 1500
-    ` -sampling-factor 4:2:0 -strip -interlace JPEG -quality ${quality} "${outPath}"`;
-
+      `${IM_BIN} "${inPath}" -resize ${safeMax}x${safeMax}>` +
+      ` -sampling-factor 4:2:0 -strip -interlace JPEG -quality ${quality} "${outPath}"`;
 
     await new Promise((resolve, reject) =>
       exec(cmd, (err, _o, stderr) => err ? reject(new Error(stderr || String(err))) : resolve())
@@ -313,8 +310,6 @@ async function optimizeJpegBuffer(inputBuffer, maxWidth = 1500, quality = 85) {
 
     const out = fs.readFileSync(outPath);
     fs.rmSync(tmpDir, { recursive: true, force: true });
-
-    // Failsafe: se não ficar menor, mantém o original
     return out;
   } catch (e) {
     console.error('optimizeJpegBuffer falhou; usando original:', e.message);
@@ -322,12 +317,6 @@ async function optimizeJpegBuffer(inputBuffer, maxWidth = 1500, quality = 85) {
   }
 }
 
-
-
-/**
- * Se o PDF for maior que 4 MB, comprime via Ghostscript.
- * Caso contrário, retorna o buffer original.
- */
 /**
  * Se o PDF for maior que 4 MB, tenta comprimir com Ghostscript.
  * Se não houver GS ou der erro, retorna o buffer original.
@@ -337,28 +326,35 @@ async function compressPDFIfNeeded(file) {
   if (!file || !file.buffer) return file?.buffer || Buffer.alloc(0);
   if (file.buffer.length <= MAX_SIZE) return file.buffer;
 
+  // Windows: prefer gswin64c
+  const GS_BIN = process.platform === 'win32' ? 'gswin64c' : 'gs';
+
   // Se GS não existir, não falha o fluxo
   try {
     if (typeof hasBinary === 'function') {
-      const ok = await hasBinary('gs');
+      const ok = await hasBinary(GS_BIN);
       if (!ok) {
         console.warn('[compressPDFIfNeeded] Ghostscript ausente; pulando compressão.');
         return file.buffer;
       }
     }
   } catch {
-    console.warn('[compressPDFIfNeeded] Erro checando gs; pulando compressão.');
+    console.warn('[compressPDFIfNeeded] Erro checando GS; pulando compressão.');
     return file.buffer;
   }
 
   const safeName = sanitizeFilename(file.originalname || `in_${Date.now()}.pdf`);
   const timestamp = Date.now();
-  const tmpIn  = `/tmp/${timestamp}_${safeName}`;
-  const tmpOut = `/tmp/compressed_${timestamp}_${safeName}`;
+
+  // ✅ Windows-friendly temp
+  const tmpBase = os.tmpdir();
+  const tmpIn  = path.join(tmpBase, `${timestamp}_${safeName}`);
+  const tmpOut = path.join(tmpBase, `compressed_${timestamp}_${safeName}`);
+
   fs.writeFileSync(tmpIn, file.buffer);
 
   const cmd = [
-    'gs -sDEVICE=pdfwrite',
+    `${GS_BIN} -sDEVICE=pdfwrite`,
     '-dCompatibilityLevel=1.4',
     '-dPDFSETTINGS=/screen',
     '-dDownsampleColorImages=true',
@@ -388,26 +384,18 @@ async function compressPDFIfNeeded(file) {
 }
 
 // Importa a classe PDFImage do pdf-image
-const PDFImage = require("pdf-image").PDFImage;
+const PDFImage = require('pdf-image').PDFImage;
 
-
-app.use(cors({
-  exposedHeaders: ['Content-Disposition']
-}));
+app.use(cors({ exposedHeaders: ['Content-Disposition'] }));
 app.use(express.urlencoded({ extended: true }));
 
-// -----------------------------------------------------
 // Função para remover acentos e caracteres especiais do nome do arquivo
 function sanitizeFilename(filename) {
   return filename
-    // Separa acentos
-    .normalize("NFD")
-    // Remove acentos (faixa U+0300 a U+036f)
-    .replace(/[\u0300-\u036f]/g, "")
-    // Substitui qualquer caractere fora de [a-zA-Z0-9._-] por underscore
-    .replace(/[^\w.\-]/g, "_");
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\w.\-]/g, '_');
 }
-// -----------------------------------------------------
 
 async function hasBinary(bin) {
   try {
@@ -416,40 +404,22 @@ async function hasBinary(bin) {
   } catch { return false; }
 }
 
+// Verifica variáveis de ambiente obrigatórias (ajuste: aceita JWT_SECRET OU JJWT_SECRET)
+const JWT_SECRET_EFFECTIVE = process.env.JWT_SECRET || process.env.JJWT_SECRET;
 
-// Verifica variáveis de ambiente obrigatórias
-// Verifica variáveis de ambiente obrigatórias (condicionais por provider)
-if (!process.env.MONGODB_URL || !process.env.JWT_SECRET) {
-  console.error('Erro: defina MONGODB_URL e JWT_SECRET nas variáveis de ambiente.');
+if (!process.env.MONGODB_URL || !JWT_SECRET_EFFECTIVE) {
+  console.error('Erro: defina MONGODB_URL e JWT_SECRET (ou JJWT_SECRET) nas variáveis de ambiente.');
   process.exit(1);
 }
 
-const provider = (process.env.EMAIL_PROVIDER || 'gmail').toLowerCase();
-if (provider === 'sendgrid') {
-  if (!process.env.SENDGRID_API_KEY || !process.env.FROM_EMAIL) {
-    console.error('Erro: para EMAIL_PROVIDER=sendgrid, defina SENDGRID_API_KEY e FROM_EMAIL.');
-    process.exit(1);
-  }
-} else {
-  // usando Gmail/Nodemailer
-  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    console.warn('[AVISO] Usando Gmail: defina EMAIL_USER e EMAIL_PASS. (SMTP pode falhar no Render Free)');
-  }
-}
-
-
-
 // Conexão com MongoDB
-mongoose
-  .connect(process.env.MONGODB_URL, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  })
+mongoose.connect(process.env.MONGODB_URL)
   .then(() => console.log('MongoDB conectado'))
   .catch((err) => {
     console.error('Erro ao conectar ao MongoDB:', err);
     process.exit(1);
   });
+
 
 // Schema e Model de usuário
 const userSchema = new mongoose.Schema({
@@ -457,14 +427,15 @@ const userSchema = new mongoose.Schema({
   email:    { type: String, required: true, unique: true },
   password: { type: String, required: true },
   role: {
-  type: String,
-  enum: ['classe_a', 'classe_b', 'classe_c', 'classe_d', 'classe_e', 'admin'],
-  default: 'classe_a'}
+    type: String,
+    enum: ['classe_a', 'classe_b', 'classe_c', 'classe_d', 'classe_e', 'admin'],
+    default: 'classe_a'
+  }
 });
 const User = mongoose.model('User', userSchema);
 
 // Modelo de dados para usuários (já existe, vamos reaproveitar)
-const Usuario = User; // para manter coerência com /usuarios
+const Usuario = User;
 
 // Schema e model para usuários externos autorizados
 const usuarioExternoSchema = new mongoose.Schema({
@@ -480,20 +451,19 @@ const contratoSchema = new mongoose.Schema({
 });
 const Contrato = mongoose.model('Contrato', contratoSchema);
 
-
 // =================== Processos SEI ===================
 const processSchema = new mongoose.Schema({
-  seiNumber: String,        // "50612.500131/2017-19"
-  seiNumberNorm: String,    // "50612500131201719" (se tiver)
-  subject: String,          // anotação/assunto
-  title: String,            // especificação/título
-  type: String,             // tipo
-  tags: [String],           // array de tags
-  unit: String,             // unidade / assignedTo
+  seiNumber: String,
+  seiNumberNorm: String,
+  subject: String,
+  title: String,
+  type: String,
+  tags: [String],
+  unit: String,
   assignedTo: String,
   status: String,
-  contracts: [String],      // opcional
-  diasUltimaMovimentacao: Number,  // ← NOVO: quantos dias desde a última movimentação
+  contracts: [String],
+  diasUltimaMovimentacao: Number,
   updatedAtSEI: Date,
   updatedAt: Date,
   lastSyncedAt: Date,
@@ -502,7 +472,7 @@ const processSchema = new mongoose.Schema({
 
 const Process = mongoose.models.Process || mongoose.model('Process', processSchema);
 
-// Exemplo de handler GET /api/processes
+// GET /api/processes
 app.get('/api/processes', async (req, res) => {
   try {
     const { search = '', page = 1, limit = 10 } = req.query;
@@ -512,31 +482,21 @@ app.get('/api/processes', async (req, res) => {
     let query = {};
     if (search && search.trim().length >= 2) {
       const term = search.trim();
-
-      // normalização leve para números
       const normalizado = term.replace(/[.\-\/\s]/g, '');
       const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-      const rx = new RegExp(esc(term), 'i');          // termo original
-      const rxNorm = new RegExp(esc(normalizado), 'i'); // termo normalizado (números)
+      const rx = new RegExp(esc(term), 'i');
+      const rxNorm = new RegExp(esc(normalizado), 'i');
 
-      // Campos da sua coleção (pelo seu print): seiNumber, seiNumberNorm, title, subject, unit, status, tags
       query = {
         $or: [
-          // números
           { seiNumber: rx },
           { seiNumberNorm: rxNorm },
-
-          // títulos/assunto
           { title: rx },
           { subject: rx },
-
-          // ATRIBUIÇÃO/UNIDADE
           { unit: rx },
-
-          // extras úteis
           { status: rx },
-          { tags: rx } // array de strings aceita regex
+          { tags: rx }
         ]
       };
     }
@@ -553,8 +513,6 @@ app.get('/api/processes', async (req, res) => {
     return res.status(500).json({ error: 'internal_error' });
   }
 });
-/////
-
 
 // Rota para buscar documentos pelo seiNumberNorm direto
 app.get('/api/processes/by-sei/:seiNumberNorm/documents', async (req, res) => {
@@ -563,10 +521,7 @@ app.get('/api/processes/by-sei/:seiNumberNorm/documents', async (req, res) => {
 
     const items = await mongoose.connection
       .collection('processDocuments')
-      .find(
-        { seiNumberNorm },
-        { projection: { _id: 0, docNumber: 1, docTitle: 1 } }
-      )
+      .find({ seiNumberNorm }, { projection: { _id: 0, docNumber: 1, docTitle: 1 } })
       .sort({ docNumber: 1 })
       .toArray();
 
@@ -577,31 +532,24 @@ app.get('/api/processes/by-sei/:seiNumberNorm/documents', async (req, res) => {
   }
 });
 
-
 // Lista documentos relacionados a um processo pelo _id
 app.get('/api/processes/:id/documents', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Validação de ObjectId usando o driver nativo do mongoose
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'ID inválido' });
     }
 
-    // Busca o processo apenas para obter o seiNumberNorm
     const process = await Process.findById(id, { seiNumberNorm: 1 }).lean();
     if (!process) {
       return res.status(404).json({ error: 'Processo não encontrado' });
     }
 
-    // A coleção de documentos não tem Mongoose Model no seu arquivo, então usamos o driver nativo do mongoose
     const items = await mongoose.connection
       .collection('processDocuments')
-      .find(
-        { seiNumberNorm: process.seiNumberNorm },
-        { projection: { _id: 0, docNumber: 1, docTitle: 1 } }
-      )
-      .sort({ docNumber: 1 }) // remova se não precisar ordenar
+      .find({ seiNumberNorm: process.seiNumberNorm }, { projection: { _id: 0, docNumber: 1, docTitle: 1 } })
+      .sort({ docNumber: 1 })
       .toArray();
 
     return res.json({ count: items.length, items });
@@ -611,10 +559,6 @@ app.get('/api/processes/:id/documents', async (req, res) => {
   }
 });
 
-
-
-
-// ...
 // Rota para listar usuários (sem a senha)
 app.get('/usuarios', async (req, res) => {
   try {
@@ -628,19 +572,19 @@ app.get('/usuarios', async (req, res) => {
 
 app.get('/_debug/ocr-binaries', async (req, res) => {
   try {
+    const GS_BIN = process.platform === 'win32' ? 'gswin64c' : 'gs';
     const out = {
-      ocrmypdf: typeof hasBinary === 'function' ? await hasBinary('ocrmypdf') : false,
-      tesseract: typeof hasBinary === 'function' ? await hasBinary('tesseract') : false,
-      pdftoppm: typeof hasBinary === 'function' ? await hasBinary('pdftoppm') : false,
-      gs: typeof hasBinary === 'function' ? await hasBinary('gs') : false,
-      convert: typeof hasBinary === 'function' ? await hasBinary(process.platform === 'win32' ? 'magick' : 'convert') : false,
+      ocrmypdf: await hasBinary('ocrmypdf'),
+      tesseract: await hasBinary('tesseract'),
+      pdftoppm: await hasBinary('pdftoppm'),
+      gs: await hasBinary(GS_BIN),
+      magick: await hasBinary(process.platform === 'win32' ? 'magick' : 'convert'),
     };
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 // Rota para remover um usuário externo pelo ID
 app.delete('/usuarios-externos/:id', async (req, res) => {
@@ -674,9 +618,7 @@ app.post('/signup', express.json(), async (req, res) => {
     if (!username || !email || !password) {
       return res.status(400).send('Todos os campos são obrigatórios');
     }
-    const existingUser = await User.findOne({
-      $or: [{ username }, { email }],
-    });
+    const existingUser = await User.findOne({ $or: [{ username }, { email }] });
     if (existingUser) {
       return res.status(400).send('Usuário ou e-mail já cadastrado');
     }
@@ -705,14 +647,12 @@ app.post('/login', express.json(), async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).send('Senha incorreta');
 
-    // Gera o token JWT com o ID e o nível de acesso (role)
     const token = jwt.sign(
       { id: user._id, role: user.role },
-      process.env.JWT_SECRET,
+      JWT_SECRET_EFFECTIVE,
       { expiresIn: '1h' }
     );
 
-    // Envia o token e a role; se quiser pode incluir também nome e email
     res.send({
       token,
       role: user.role,
@@ -725,7 +665,6 @@ app.post('/login', express.json(), async (req, res) => {
     res.status(500).send('Erro no servidor');
   }
 });
-
 
 // Rota para inserir usuários externos
 app.post('/usuarios-externos', express.json(), async (req, res) => {
@@ -748,11 +687,10 @@ app.post('/usuarios-externos', express.json(), async (req, res) => {
   }
 });
 
-
 // Rota para listar todos os usuários externos
 app.get('/usuarios-externos', async (req, res) => {
   try {
-    const lista = await UsuarioExterno.find().sort({ nome: 1 }); // ordena por nome
+    const lista = await UsuarioExterno.find().sort({ nome: 1 });
     res.json(lista);
   } catch (err) {
     console.error('Erro ao buscar usuários externos:', err);
@@ -760,7 +698,7 @@ app.get('/usuarios-externos', async (req, res) => {
   }
 });
 
-    app.post('/contratos', express.json(), async (req, res) => {
+app.post('/contratos', express.json(), async (req, res) => {
   try {
     const { numero } = req.body;
     if (!numero) {
@@ -790,12 +728,10 @@ app.post('/merge-pdf', upload.array('pdfs'), async (req, res) => {
       return res.status(400).send('É necessário enviar pelo menos dois arquivos PDF');
     }
 
-    // Ordena por nome para padronizar a base do arquivo final
     const arquivosOrdenados = [...req.files].sort((a, b) =>
       a.originalname.localeCompare(b.originalname, 'pt', { numeric: true, sensitivity: 'base' })
     );
 
-    // Gera nome de download a partir do primeiro
     const baseName = path.parse(arquivosOrdenados[0].originalname).name;
     const safeBase = baseName.replace(/[^\w\-]+/g, '_');
     const downloadName = `${safeBase}_merge.pdf`;
@@ -811,7 +747,6 @@ app.post('/merge-pdf', upload.array('pdfs'), async (req, res) => {
         return res.status(400).send(`Arquivo não é PDF: ${file.originalname}`);
       }
 
-      // ignoreEncryption ajuda quando o PDF tem “permissões” mas sem senha interativa
       const pdf = await PDFDocument.load(file.buffer, { ignoreEncryption: true });
       const pages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
       pages.forEach(p => mergedPdf.addPage(p));
@@ -821,7 +756,6 @@ app.post('/merge-pdf', upload.array('pdfs'), async (req, res) => {
 
     res.set('Content-Type', 'application/pdf');
     res.set('Content-Length', String(buf.length));
-    // filename + filename* para lidar com UTF-8 corretamente
     res.set('Content-Disposition',
       `attachment; filename="${downloadName}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`
     );
@@ -867,8 +801,6 @@ function parseRanges(spec, totalPages) {
   return ranges;
 }
 
-
-
 app.post('/split-pdf', upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file || req.file.mimetype !== 'application/pdf') {
@@ -901,7 +833,6 @@ app.post('/split-pdf', upload.single('pdf'), async (req, res) => {
 
     const zipBuffer = zip.toBuffer();
 
-    // Base do nome: arquivo enviado, sem extensão
     const baseName = path.parse(req.file.originalname).name;
     const safeBase = baseName.replace(/[^\w\-]+/g, '_');
     const downloadName = `${safeBase}_split.zip`;
@@ -910,14 +841,11 @@ app.post('/split-pdf', upload.single('pdf'), async (req, res) => {
     res.set('Content-Disposition', `attachment; filename="${downloadName}"`);
     return res.send(zipBuffer);
 
-
   } catch (err) {
     console.error('Erro no split-pdf:', err);
     res.status(400).send(`Erro ao dividir PDF: ${err.message}`);
   }
 });
-
-
 
 // Rota para listar contratos (GET)
 app.get('/contratos', async (req, res) => {
@@ -930,7 +858,6 @@ app.get('/contratos', async (req, res) => {
   }
 });
 
-
 app.use((req, res, next) => {
   if (req.path === '/send-email') {
     console.log('[DEBUG] chegou em /send-email - método', req.method);
@@ -939,113 +866,92 @@ app.use((req, res, next) => {
 });
 
 app.post('/send-email', upload.any(), async (req, res) => {
-    console.log('[DEBUG] chegou no /send-email - método POST');
+  console.log('[DEBUG] chegou no /send-email - método POST');
   try {
     console.log('Dados recebidos no formulário:', req.body);
     const fluxo = req.body.fluxo;
     const dados = req.body;
-   // if (!dados.email) {
-   //   return res.status(400).send('O campo de e-mail é obrigatório.');
-   // }
 
-      const token = req.headers.authorization?.split(" ")[1];
-      if (!token) return res.status(401).send("Token não fornecido.");
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).send('Token não fornecido.');
 
-      let userId;
-      try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        userId = decoded.id;
-      } catch (err) {
-        return res.status(401).send("Token inválido.");
-      }
+    let userId;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET_EFFECTIVE);
+      userId = decoded.id;
+    } catch (err) {
+      return res.status(401).send('Token inválido.');
+    }
 
-      const usuario = await Usuario.findById(userId);
-
+    const usuario = await Usuario.findById(userId);
     if (!usuario) {
-      return res.status(404).send("Usuário não encontrado.");
+      return res.status(404).send('Usuário não encontrado.');
     }
 
     let mailContent = `Fluxo: ${fluxo}\n\nDados do formulário:\n`;
 
+    function getSeiFromDados(d) {
+      const direto =
+        d.processoSei ||
+        d.seiTrim ||
+        d.sei ||
+        d.numeroSei ||
+        d.numero_sei ||
+        d['Número do processo SEI'];
 
-// Captura o número SEI vindo em alguma chave ou, se não vier,
-// tenta extrair de subject/text com REGEX (ex.: 50612.002776/2025-09)
-function getSeiFromDados(d) {
-  const direto =
-    d.processoSei ||
-    d.seiTrim ||
-    d.sei ||
-    d.numeroSei ||
-    d.numero_sei ||
-    d['Número do processo SEI'];
+      if (direto && String(direto).trim()) return String(direto).trim();
 
-  if (direto && String(direto).trim()) return String(direto).trim();
+      const tryFields = [d.subject, d.assunto, d.text, d.mensagem];
+      const reSei = /(\d{5}\.\d{6}\/\d{4}-\d{2})/;
 
-  const tryFields = [d.subject, d.assunto, d.text, d.mensagem];
-  const reSei = /(\d{5}\.\d{6}\/\d{4}-\d{2})/; // padrão SEI
+      for (const f of tryFields) {
+        if (!f) continue;
+        const m = String(f).match(reSei);
+        if (m && m[1]) return m[1];
+      }
+      return '';
+    }
 
-  for (const f of tryFields) {
-    if (!f) continue;
-    const m = String(f).match(reSei);
-    if (m && m[1]) return m[1];
-  }
-  return '';
-}
+    const numeroSei = getSeiFromDados(dados);
 
-const numeroSei = getSeiFromDados(dados);
+    const { envio, quando, quandoUtc } = req.body;
 
-    
-    
-// === Agendamento para o Power Automate (sempre envia "Agendamento:") ===
-const { envio, quando, quandoUtc } = req.body;
+    function spToUtcIso(localStr) {
+      if (!localStr) return null;
 
-// Converte "YYYY-MM-DDTHH:MM" OU "YYYY-MM-DD HH:MM" (24h)
-// OU "YYYY-MM-DD HH:MM AM/PM" assumindo America/Sao_Paulo (-03:00) -> ISO UTC (...:SSZ)
-function spToUtcIso(localStr) {
-  if (!localStr) return null;
+      let m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})$/.exec(localStr);
+      if (!m) {
+        const m12 = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(localStr);
+        if (!m12) return null;
+        let hh = (+m12[4]) % 12;
+        if (/pm/i.test(m12[6])) hh += 12;
+        m = [null, m12[1], m12[2], m12[3], String(hh).padStart(2, '0'), m12[5]];
+      }
 
-  // 24h com 'T' ou espaço
-  let m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})$/.exec(localStr);
-  if (!m) {
-    // 12h com AM/PM
-    const m12 = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(localStr);
-    if (!m12) return null;
-    let hh = (+m12[4]) % 12;
-    if (/pm/i.test(m12[6])) hh += 12;
-    m = [null, m12[1], m12[2], m12[3], String(hh).padStart(2,'0'), m12[5]];
-  }
+      const y = +m[1], mo = +m[2], d = +m[3], hh = +m[4], mi = +m[5];
+      const ms = Date.UTC(y, mo - 1, d, hh + 4, mi, 0);
+      return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    }
 
-  const y  = +m[1], mo = +m[2], d = +m[3], hh = +m[4], mi = +m[5];
-  const ms = Date.UTC(y, mo - 1, d, hh + 4, mi, 0); // SP (-03:00) -> UTC
-  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
-}
+    let agIso = null;
+    if (envio === 'agendar') {
+      agIso = spToUtcIso(quando) ||
+        (quandoUtc && (() => {
+          const d = new Date(quandoUtc);
+          return isNaN(d) ? null : d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+        })());
+    } else {
+      agIso = new Date(Date.now() + 5 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    }
 
-// Enviamos SEMPRE "Agendamento:" para o Flow
-let agIso = null;
-if (envio === 'agendar') {
-  // tenta parsear o input; se não der, usa quandoUtc do front
-  agIso = spToUtcIso(quando)
-       || (quandoUtc && (() => {
-            const d = new Date(quandoUtc);
-            return isNaN(d) ? null : d.toISOString().replace(/\.\d{3}Z$/, 'Z');
-          })());
-} else {
-  // imediato -> agora + 5s (buffer p/ nunca cair no passado)
-  agIso = new Date(Date.now() + 5 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
-}
+    if (agIso) {
+      mailContent += `Agendamento: ${agIso}\n`;
+    }
 
-if (agIso) {
-  mailContent += `Agendamento: ${agIso}\n`;
-}
-// === fim bloco de agendamento ===
-
-
-
-    
     mailContent += `Requerente: ${usuario?.username || 'Desconhecido'}\n`;
     mailContent += `Email: ${usuario?.email || 'Não informado'}\n`;
 
-    let attachments = []; // <-- precisa estar aqui no começo do try
+    let attachments = [];
 
     if (fluxo === 'Liberar assinatura externa') {
       mailContent += `Assinante: ${dados.assinante || ''}\n`;
@@ -1057,47 +963,47 @@ if (agIso) {
     } else if (fluxo === 'Liberar acesso externo') {
       mailContent += `Usuário: ${dados.user || ''}\n`;
       mailContent += `Número do Processo SEI: ${dados.processo_sei || ''}\n`;
-//***//
-      
-       } else if (fluxo === 'Analise de processo') {
-  mailContent += `Número do Processo SEI: ${dados.processo_sei || ''}\n`;
 
-  // Mapeia fieldname → fileId
-  const idMap = {
-    memoriaCalculo: process.env.MEMORIA_FILE_ID,
-    diarioObra:     process.env.DIARIO_FILE_ID,
-    relatorioFotografico: process.env.RELATORIO_FILE_ID
-  };
+    } else if (fluxo === 'Analise de processo') {
+      mailContent += `Número do Processo SEI: ${dados.processo_sei || ''}\n`;
 
-  for (const file of req.files) {
-    const fileId = idMap[file.fieldname];
-    if (!fileId) continue;              // ignora outros campos
-    if (file.mimetype !== 'application/pdf') {
-      return res.status(400).send(`Tipo inválido: ${file.originalname}`);
-    }
-    // sobrescreve no Drive
-    await overwriteDriveFile(fileId, file.buffer, file.mimetype);
-    console.log(`Atualizado no Drive: ${file.fieldname} (fileId=${fileId})`);
-  }
+      const idMap = {
+        memoriaCalculo: process.env.MEMORIA_FILE_ID,
+        diarioObra: process.env.DIARIO_FILE_ID,
+        relatorioFotografico: process.env.RELATORIO_FILE_ID
+      };
 
-//***//
+      for (const file of req.files) {
+        const fileId = idMap[file.fieldname];
+        if (!fileId) continue;
+        if (file.mimetype !== 'application/pdf') {
+          return res.status(400).send(`Tipo inválido: ${file.originalname}`);
+        }
+        await overwriteDriveFile(fileId, file.buffer, file.mimetype);
+        console.log(`Atualizado no Drive: ${file.fieldname} (fileId=${fileId})`);
+      }
 
-  } else if (fluxo === 'Alterar ordem de documentos') {
+    } else if (fluxo === 'Alterar ordem de documentos') {
       mailContent += `Número do Processo SEI: ${dados.processoSei || ''}\n`;
       mailContent += `Instruções: ${dados.instrucoes || ''}\n`;
+
     } else if (fluxo === 'Inserir anexo em doc SEI') {
       mailContent += `Número do DOC_SEI: ${dados.numeroDocSei || ''}\n`;
+
     } else if (fluxo === 'Inserir imagem em doc SEI') {
       mailContent += `Número do DOC_SEI: ${dados.numeroDocSei || ''}\n`;
+
     } else if (fluxo === 'Assinatura em doc SEI') {
       mailContent += `Número do DOC_SEI: ${dados.numeroDocSei || ''}\n`;
       mailContent += `Usuário: ${dados.user || ''}\n`;
       mailContent += `Senha: ${dados.key || ''}\n`;
+
     } else if (fluxo === 'Criar Doc SEI Editável') {
       mailContent += `Número do Processo SEI: ${dados.processoSei || ''}\n`;
       mailContent += `Tipo do Documento: ${dados.tipoDocumento || ''}\n`;
       mailContent += `Número: ${dados.numero || ''}\n`;
       mailContent += `Nome na Árvore: ${dados.nomeArvore || ''}\n`;
+
     } else if (fluxo === 'Criar Doc SEI Externo') {
       const agora = new Date();
       agora.setHours(agora.getHours() - 3);
@@ -1110,41 +1016,21 @@ if (agIso) {
       mailContent += `Tipo do Documento: ${dados.tipoDocumento || ''}\n`;
       mailContent += `Número: ${dados.numero || ''}\n`;
       mailContent += `Nome na Árvore: ${dados.nomeArvore || ''}\n`;
+
+    } else if (fluxo === 'Atualizar lista de documentos') {
+      if (numeroSei) {
+        mailContent += `Número do Processo SEI: ${numeroSei}\n`;
+      }
     }
 
-   else if (fluxo === 'Atualizar lista de documentos') {
-  if (numeroSei) {
-    mailContent += `Número do Processo SEI: ${numeroSei}\n`;
-  }
-}
-
-
-    
-    // Configura o transporte de e-mail
-    const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-    });
-
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: 'jadsonnogueira@msn.com',
-      subject: `${fluxo}`,
-      text: mailContent,
-    };
-
-    // Verifica se há arquivos enviados
     if (req.files && req.files.length > 0) {
       for (const file of req.files) {
-        // Sanitiza o nome do arquivo enviado
         const safeOriginalName = sanitizeFilename(file.originalname);
 
         if (file.fieldname.startsWith('imagem')) {
-          // Valida se é imagem
           if (!file.mimetype.startsWith('image/')) {
             return res.status(400).send(`Tipo de arquivo não permitido: ${file.originalname}`);
           }
-          // Limite de 5 MB
           if (file.size > 5 * 1024 * 1024) {
             return res.status(400).send(`Arquivo muito grande: ${file.originalname}`);
           }
@@ -1168,7 +1054,6 @@ if (agIso) {
               if (fileContent.length > 5 * 1024 * 1024) {
                 return res.status(400).send(`Arquivo muito grande no ZIP: ${entry.entryName}`);
               }
-              // Sanitiza o nome de cada arquivo dentro do ZIP
               const safeZipName = sanitizeFilename(entry.entryName);
               attachments.push({ filename: safeZipName, content: fileContent });
             }
@@ -1177,208 +1062,130 @@ if (agIso) {
             return res.status(400).send('Erro ao processar o arquivo ZIP.');
           }
 
-        }else if (file.fieldname === 'arquivo') {
-          // Anexa o PDF (ou qualquer arquivo) sem compressão
+        } else if (file.fieldname === 'arquivo') {
           attachments.push({ filename: safeOriginalName, content: file.buffer });
-        
-       } else if (file.fieldname === 'arquivoPdf') {
-  const deveConverterPDF = ['Criar Doc SEI Editável', 'Inserir imagem em doc SEI', 'PDF para JPG'].includes(fluxo);
 
-  try {
-    if (!/application\/pdf/i.test(file.mimetype)) {
-      return res.status(400).send(`Arquivo inválido (esperado PDF): ${file.originalname}`);
+        } else if (file.fieldname === 'arquivoPdf') {
+          try {
+            if (!/application\/pdf/i.test(file.mimetype)) {
+              return res.status(400).send(`Arquivo inválido (esperado PDF): ${file.originalname}`);
+            }
+
+            const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-'));
+            const inputPath = path.join(tempDir, 'input.pdf');
+            fs.writeFileSync(inputPath, file.buffer);
+
+            const TARGET = 1500;
+            const safeBase = sanitizeFilename(file.originalname.replace(/\.pdf$/i, ''));
+            const outputPrefix = path.join(tempDir, 'page');
+
+            const command = `pdftoppm -jpeg -scale-to ${TARGET} -jpegopt quality=82 "${inputPath}" "${outputPrefix}"`;
+            await new Promise((resolve, reject) => {
+              exec(command, (error, _stdout, stderr) =>
+                error ? reject(new Error(stderr || error.message)) : resolve()
+              );
+            });
+
+            const allFiles = fs.readdirSync(tempDir)
+              .filter(name => /^page-\d+\.jpg$/i.test(name))
+              .sort((a, b) => {
+                const ai = parseInt(a.match(/^page-(\d+)\.jpg$/i)[1], 10);
+                const bi = parseInt(b.match(/^page-(\d+)\.jpg$/i)[1], 10);
+                return ai - bi;
+              });
+
+            if (allFiles.length === 0) {
+              throw new Error('Nenhuma imagem gerada pelo pdftoppm');
+            }
+
+            for (const fname of allFiles) {
+              const imagePath = path.join(tempDir, fname);
+              const imgBuffer = fs.readFileSync(imagePath);
+              const optimized = await optimizeJpegBuffer(imgBuffer, TARGET, 82);
+
+              const n = parseInt(fname.match(/^page-(\d+)\.jpg$/i)[1], 10);
+              attachments.push({
+                filename: `${safeBase}_page_${String(n).padStart(3, '0')}.jpg`,
+                content: optimized,
+                contentType: 'image/jpeg'
+              });
+
+              try { fs.unlinkSync(imagePath); } catch {}
+            }
+
+            try { fs.unlinkSync(inputPath); } catch {}
+            try { fs.rmdirSync(tempDir, { recursive: true }); } catch {}
+
+          } catch (error) {
+            console.error('Erro na conversão de PDF para JPG (send-email/arquivoPdf):', error.message);
+            return res.status(400).send('Erro na conversão do PDF para JPG: ' + error.message);
+          }
+        }
+      }
     }
 
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-'));
-    const inputPath = path.join(tempDir, 'input.pdf');
-    fs.writeFileSync(inputPath, file.buffer);
+    const totalBytes = attachments.reduce((sum, a) => sum + (a.content?.length || 0), 0);
+    console.log(`Total de bytes nos attachments (raw): ${totalBytes}`);
+    console.log(`Total estimado com Base64 (~4/3): ${Math.round(totalBytes * 4 / 3)}`);
+    console.log('Attachments nomes:', attachments.map(a => a.filename));
 
-    const TARGET = 1500; // lado maior
-    const safeBase = sanitizeFilename(file.originalname.replace(/\.pdf$/i, ''));
-    const outputPrefix = path.join(tempDir, 'page'); // gera page-1.jpg, page-2.jpg, ...
+    const provider = (process.env.EMAIL_PROVIDER || 'gmail').toLowerCase();
 
-    // 🔹 Gera TODAS as páginas de uma vez
-    const command = `pdftoppm -jpeg -scale-to ${TARGET} -jpegopt quality=82 "${inputPath}" "${outputPrefix}"`;
-    await new Promise((resolve, reject) => {
-      exec(command, (error, _stdout, stderr) =>
-        error ? reject(new Error(stderr || error.message)) : resolve()
-      );
-    });
+    if (provider === 'resend') {
+      const { sendWithResend } = require('./email/resend');
 
-    // 🔹 Coleta todos os arquivos gerados
-    const allFiles = fs.readdirSync(tempDir)
-      .filter(name => /^page-\d+\.jpg$/i.test(name))
-      .sort((a, b) => {
-        const ai = parseInt(a.match(/^page-(\d+)\.jpg$/i)[1], 10);
-        const bi = parseInt(b.match(/^page-(\d+)\.jpg$/i)[1], 10);
-        return ai - bi;
+      try {
+        const safeHtml = `<pre>${mailContent.replace(/[&<>]/g, s => (
+          { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[s]
+        ))}</pre>`;
+
+        const result = await sendWithResend({
+          to: 'jadsonnogueira@msn.com',
+          subject: `${fluxo}`,
+          text: mailContent,
+          html: safeHtml,
+          attachments,
+        });
+
+        console.log('[EMAIL] Enviado via Resend. id=', result && result.id);
+        return res.send('E-mail enviado com sucesso');
+      } catch (err) {
+        const payloadErr = err?.response?.data || err?.message || err;
+        console.error('Erro ao enviar via Resend:', payloadErr);
+        return res.status(500).type('text/plain').send('Erro ao enviar o e-mail (Resend).');
+      }
+
+    } else {
+      // Gmail SMTP (Nodemailer)
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
       });
 
-    if (allFiles.length === 0) {
-      throw new Error('Nenhuma imagem gerada pelo pdftoppm');
+      const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: 'jadsonnogueira@msn.com',
+        subject: `${fluxo}`,
+        text: mailContent,
+        attachments,
+      };
+
+      transporter.sendMail(mailOptions)
+        .then(info => {
+          console.log('[SEND] ✅ ok messageId=', info && info.messageId);
+          return res.send('E-mail enviado com sucesso');
+        })
+        .catch(err => {
+          const msg = (err && (err.response || err.message)) || String(err);
+          console.error('[SEND][SMTP ERROR] ❌', msg);
+          return res.status(500).type('text/plain').send(`Erro ao enviar o e-mail: ${msg}`);
+        });
     }
 
-    // 🔹 Anexa todas, otimizando cada uma
-    for (const fname of allFiles) {
-      const imagePath = path.join(tempDir, fname);
-      const imgBuffer = fs.readFileSync(imagePath);
-      const optimized = await optimizeJpegBuffer(imgBuffer, TARGET, 82);
-
-      const n = parseInt(fname.match(/^page-(\d+)\.jpg$/i)[1], 10);
-      attachments.push({
-        filename: `${safeBase}_page_${String(n).padStart(3, '0')}.jpg`,
-        content: optimized,
-        contentType: 'image/jpeg'
-      });
-
-      try { fs.unlinkSync(imagePath); } catch {}
-    }
-
-    console.log(`[send-email][arquivoPdf] Geradas ${allFiles.length} imagens para ${file.originalname}. attachments total=${attachments.length}`);
-
-    try { fs.unlinkSync(inputPath); } catch {}
-    try { fs.rmdirSync(tempDir, { recursive: true }); } catch {}
-
-  } catch (error) {
-    console.error("Erro na conversão de PDF para JPG (send-email/arquivoPdf):", error.message);
-    return res.status(400).send("Erro na conversão do PDF para JPG: " + error.message);
-  }
-} // <-- fecha corretamente o else if
-        
-      } // <-- fecha o for (const file of req.files)
-    }   // <-- fecha o if (req.files && req.files.length > 0)
-
-
-// Se houver anexos, adiciona ao e-mail **(mantém apenas na RAM; envio decide abaixo)**
-// (não monte mais mailOptions aqui — vamos decidir o provedor primeiro)
-if (!Array.isArray(attachments)) {
-  // garantia
-  attachments = [];
-}
-
-// ===== LOG de tamanho e nomes (mantém seus logs) =====
-const totalBytes = attachments.reduce((sum, a) => sum + (a.content?.length || 0), 0);
-console.log(`Total de bytes nos attachments (raw): ${totalBytes}`);
-console.log(`Total estimado com Base64 (~4/3): ${Math.round(totalBytes * 4/3)}`);
-console.log('Attachments nomes:', attachments.map(a => a.filename));
-
-// ===== Escolha do provedor por variável de ambiente =====
-const provider = (process.env.EMAIL_PROVIDER || 'resend').toLowerCase();
-
-if (provider === 'resend') {
-  // -------- Envio via Resend (API HTTP) --------
-  const { sendWithResend } = require('./email/resend');
-
-  try {
-    console.log('[EMAIL] provider=resend from=%s to=%s',
-      process.env.FROM_EMAIL,
-      'jadsonnogueira@msn.com'
-    );
-
-    // HTML simples legível (escapado e preservando quebras)
-    const safeHtml = `<pre>${mailContent.replace(/[&<>]/g, s => (
-      { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[s]
-    ))}</pre>`;
-
-    const result = await sendWithResend({
-      to: 'jadsonnogueira@msn.com',
-      subject: `${fluxo}`,
-      text: mailContent,
-      html: safeHtml,
-      attachments, // já são Buffers; o módulo converte para base64
-    });
-
-    console.log('[EMAIL] Enviado via Resend. id=', result && result.id);
-    return res.send('E-mail enviado com sucesso');
   } catch (err) {
-    const payloadErr = err?.response?.data || err?.message || err;
-    console.error('Erro ao enviar via Resend:', payloadErr);
-    return res.status(500).type('text/plain').send('Erro ao enviar o e-mail (Resend).');
+    console.error('Erro ao processar o envio de e-mail:', err);
+    return res.status(500).send('Erro no servidor');
   }
-
-} else if (provider === 'sendgrid') {
-  // -------- Envio via SendGrid (sem SMTP) --------
-  const { sendWithSendGrid } = require('./email/sendgrid');
-
-  try {
-    // Mapear Buffers -> Base64 (exigência da API do SendGrid)
-    const sgAttachments = attachments.map(a => ({
-      filename: a.filename,
-      contentBase64: Buffer.isBuffer(a.content) ? a.content.toString('base64') : String(a.content || ''),
-      contentType:
-        a.contentType ||
-        (a.filename && /\.pdf$/i.test(a.filename)  ? 'application/pdf' :
-         a.filename && /\.png$/i.test(a.filename)  ? 'image/png' :
-         a.filename && /\.jpe?g$/i.test(a.filename) ? 'image/jpeg' :
-         'application/octet-stream')
-    }));
-
-    console.log('[EMAIL] provider=sendgrid from=%s to=%s',
-      process.env.FROM_EMAIL,
-      'jadsonpena@gmail.com'
-    );
-
-    await sendWithSendGrid({
-      to: 'jadsonpena@gmail.com',
-      subject: `${fluxo}`,
-      text: mailContent,
-      html: `<pre>${mailContent.replace(/[&<>]/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[s]))}</pre>`,
-      attachments: sgAttachments
-    });
-
-    console.log('[EMAIL] Enviado via SendGrid.');
-    return res.send('E-mail enviado com sucesso');
-  } catch (err) {
-    console.error('Erro ao enviar via SendGrid:', err?.response?.body || err?.message || err);
-    return res.status(500).type('text/plain').send('Erro ao enviar o e-mail (SendGrid).');
-  }
-
-} else {
-  // -------- Envio via SMTP do domínio ablchurch.ca (Nodemailer) --------
-  console.log('[SMTP] Tentando conectar:', {
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    user: process.env.EMAIL_USER,
-  });
-
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT) || 587,
-    secure: false, // false para 587 (STARTTLS)
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
-    },
-    connectionTimeout: 10000,   // 10s timeout de conexão
-    greetingTimeout: 10000,     // 10s timeout de handshake
-  });
-
-  const mailOptions = {
-    from: `"RPA ABL Church" <${process.env.FROM_EMAIL || process.env.EMAIL_USER}>`,
-    to: 'jadsonpena@gmail.com',
-    subject: `${fluxo}`,
-    text: mailContent,
-    attachments,
-  };
-
-  console.log('[SMTP] Enviando e-mail...');
-
-  transporter.sendMail(mailOptions)
-    .then(info => {
-      console.log('[SEND] ✅ ok messageId=', info && info.messageId);
-      return res.send('E-mail enviado com sucesso');
-    })
-    .catch(err => {
-      const msg = (err && (err.response || err.message)) || String(err);
-      console.error('[SEND][SMTP ERROR] ❌', msg);
-      return res.status(500).type('text/plain').send(`Erro ao enviar o e-mail: ${msg}`);
-    });
-}
-
-} catch (err) {
-  console.error('Erro ao processar o envio de e-mail:', err);
-  return res.status(500).send('Erro no servidor');
-}
 });
 
 // /verify-token robusto: aceita GET (sem body) e não retorna 401
@@ -1391,7 +1198,7 @@ app.get('/verify-token', (req, res) => {
     if (!token) return res.json({ valid: false, error: 'Token ausente' });
 
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, JWT_SECRET_EFFECTIVE);
       return res.json({ valid: true, userId: decoded.id, role: decoded.role });
     } catch {
       return res.json({ valid: false, error: 'Token inválido ou expirado' });
@@ -1402,35 +1209,12 @@ app.get('/verify-token', (req, res) => {
   }
 });
 
-    
 // Rota para a página principal
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
 
-// Rota para verificação do token JWT
-app.post('/verify-token', (req, res) => {
-  let body = '';
-  req.on('data', chunk => (body += chunk));
-  req.on('end', () => {
-    try {
-      const { token } = JSON.parse(body);
-      if (!token) return res.status(400).json({ valid: false, error: 'Token ausente' });
-
-      jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-        if (err) {
-          return res.status(401).json({ valid: false, error: 'Token inválido ou expirado' });
-        }
-        res.json({ valid: true, userId: decoded.id, role: decoded.role });
-      });
-    } catch (err) {
-      console.error('Erro ao verificar token:', err);
-      res.status(500).json({ valid: false, error: 'Erro interno no servidor' });
-    }
-  });
-});
-
-
+// PDF -> JPG
 app.post('/pdf-to-jpg', upload.single('arquivoPdf'), async (req, res) => {
   try {
     if (!req.file || req.file.mimetype !== 'application/pdf') {
@@ -1441,7 +1225,6 @@ app.post('/pdf-to-jpg', upload.single('arquivoPdf'), async (req, res) => {
     const inputPath = path.join(tempDir, 'input.pdf');
     fs.writeFileSync(inputPath, req.file.buffer);
 
-    // Conta as páginas do PDF
     const parsed = await pdfParse(req.file.buffer);
     const numPages = parsed.numpages;
 
@@ -1452,18 +1235,14 @@ app.post('/pdf-to-jpg', upload.single('arquivoPdf'), async (req, res) => {
 
     for (let i = 1; i <= numPages; i++) {
       const outputPrefix = path.join(tempDir, `page_${i}`);
+      const TARGET = 1500;
 
-     const TARGET = 1500; // lado maior em px
-const command = `pdftoppm -jpeg -scale-to ${TARGET} -jpegopt quality=82 -f ${i} -l ${i} "${inputPath}" "${outputPrefix}"`;
-
+      const command = `pdftoppm -jpeg -scale-to ${TARGET} -jpegopt quality=82 -f ${i} -l ${i} "${inputPath}" "${outputPrefix}"`;
 
       await new Promise((resolve, reject) => {
-        exec(command, (error, stdout, stderr) => {
-          if (error) {
-            reject(new Error(`Erro ao converter página ${i}: ${stderr}`));
-          } else {
-            resolve();
-          }
+        exec(command, (error, _stdout, stderr) => {
+          if (error) reject(new Error(`Erro ao converter página ${i}: ${stderr}`));
+          else resolve();
         });
       });
 
@@ -1480,28 +1259,25 @@ const command = `pdftoppm -jpeg -scale-to ${TARGET} -jpegopt quality=82 -f ${i} 
     fs.unlinkSync(inputPath);
     fs.rmdirSync(tempDir, { recursive: true });
 
-   // Retorna como ZIP se mais de uma página
-if (attachments.length > 1) {
-  const zip = new AdmZip();
-  attachments.forEach(att => zip.addFile(att.filename, att.content));
-  const zipBuffer = zip.toBuffer();
+    if (attachments.length > 1) {
+      const zip = new AdmZip();
+      attachments.forEach(att => zip.addFile(att.filename, att.content));
+      const zipBuffer = zip.toBuffer();
 
-  res.set('Content-Type', 'application/zip');
-  res.set('Content-Disposition', `attachment; filename="${safeBase}.zip"`);
-  return res.send(zipBuffer);
-} else {
-  // JPG único
-  res.set('Content-Type', 'image/jpeg');
-  res.set('Content-Disposition', `attachment; filename="${attachments[0].filename}"`);
-  return res.send(attachments[0].content);
-}
+      res.set('Content-Type', 'application/zip');
+      res.set('Content-Disposition', `attachment; filename="${safeBase}.zip"`);
+      return res.send(zipBuffer);
+    } else {
+      res.set('Content-Type', 'image/jpeg');
+      res.set('Content-Disposition', `attachment; filename="${attachments[0].filename}"`);
+      return res.send(attachments[0].content);
+    }
 
   } catch (err) {
     console.error('Erro na conversão de PDF para JPG:', err);
     res.status(500).send('Erro ao converter PDF: ' + err.message);
   }
 });
-
 
 // OCR
 app.post('/pdf-make-searchable', upload.single('arquivoPdf'), async (req, res) => {
@@ -1510,14 +1286,11 @@ app.post('/pdf-make-searchable', upload.single('arquivoPdf'), async (req, res) =
       return res.status(400).send('Envie um "arquivoPdf" (application/pdf).');
     }
 
-   const langs = normalizeLangs(
-  req.body.lang ?? req.query.lang ?? process.env.OCR_LANGS ?? 'por+eng'
-);
+    const langs = normalizeLangs(
+      req.body.lang ?? req.query.lang ?? process.env.OCR_LANGS ?? 'por+eng'
+    );
 
-
-    // Opcional: comprimir antes se >4MB (você já tem esse helper)
     const inputBuffer = await compressPDFIfNeeded(req.file);
-
     const searchable = await makePdfSearchable(inputBuffer, langs);
 
     const baseName = path.parse(req.file.originalname).name;
@@ -1535,8 +1308,6 @@ app.post('/pdf-make-searchable', upload.single('arquivoPdf'), async (req, res) =
     return res.status(500).send('Erro ao tornar PDF pesquisável: ' + err.message);
   }
 });
-
-
 
 // Inicia o servidor
 const PORT = process.env.PORT || 8080;
