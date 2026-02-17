@@ -14,3 +14,7 @@ logs/
 # IDE/Editor files
 .vscode/
 .idea/
+
+.env
+google-sa.json
+uploads.zip
